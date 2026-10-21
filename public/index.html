@@ -25,6 +25,7 @@ input:focus,textarea:focus,select:focus{border-color:var(--accent)}
 .btn{width:100%;margin-top:18px;padding:13px;border:0;border-radius:10px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;font-weight:600;cursor:pointer}
 .btn.ghost{background:var(--panel2);border:1px solid var(--line)}
 .btn.danger{background:transparent;border:1px solid var(--danger);color:var(--danger)}
+.btn.sm{width:auto;margin-top:0;padding:8px 12px;font-size:13px}
 .err{color:var(--danger);font-size:14px;margin-top:12px;min-height:18px}
 .okmsg{color:var(--ok)}
 .app{padding:16px 16px 90px;max-width:900px;margin:0 auto}
@@ -42,14 +43,14 @@ h2{font-size:16px;margin-bottom:10px}
 .row{display:flex;align-items:center;gap:12px;padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:8px;font-size:14px;cursor:pointer}
 .row.static{cursor:default}
 .row small{color:var(--muted);display:block}
-.row .grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.row .grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .nav{position:fixed;bottom:0;left:0;right:0;display:flex;background:rgba(14,16,36,.96);border-top:1px solid var(--line);padding:8px 0 calc(8px + env(safe-area-inset-bottom));backdrop-filter:blur(10px);z-index:20}
 .nav button{flex:1;border:0;background:none;color:var(--muted);font-size:11px;display:flex;flex-direction:column;align-items:center;gap:3px;cursor:pointer}
 .nav button span{font-size:20px}
 .nav button.on{color:#a5a6ff}
 .empty{text-align:center;color:var(--muted);padding:40px 20px}
 .badge{font-size:11px;color:var(--ok);margin-left:auto}
-.chip{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:3px 9px}
+.chip{font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:3px 9px;flex-shrink:0}
 .sheet{position:fixed;inset:0;background:rgba(4,5,15,.7);display:grid;place-items:end center;z-index:40}
 .sheet .card{width:100%;max-width:440px;border-radius:18px 18px 0 0;margin:0}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;word-break:break-all}
@@ -61,7 +62,7 @@ h2{font-size:16px;margin-bottom:10px}
 .msg .who{font-size:13px;font-weight:600;color:#a5a6ff}
 .msg .when{font-size:11px;color:var(--muted);margin-left:6px;font-weight:400}
 .msg .txt{font-size:15px;line-height:1.4;word-wrap:break-word;white-space:pre-wrap;margin-top:2px}
-.msg .acts{display:flex;gap:4px;opacity:0;transition:opacity .15s}
+.msg .acts{display:flex;gap:4px;opacity:.35;transition:opacity .15s}
 .msg:hover .acts{opacity:1}
 .msg .acts button{border:0;background:var(--panel2);border-radius:6px;padding:4px 8px;font-size:12px;color:var(--muted);cursor:pointer}
 .msg .reply{border-left:2px solid var(--accent);padding-left:8px;margin-bottom:4px;font-size:12px;color:var(--muted);cursor:pointer}
@@ -86,7 +87,7 @@ h2{font-size:16px;margin-bottom:10px}
 <script>
 const LOGO='<svg viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><path fill="url(#g)" d="M16 26C12 18 6 14 2 6c6 0 11 4 14 12 3-8 8-12 14-12-4 8-10 12-14 20z"/></svg>';
 const root=document.getElementById('root');
-let me=null, tab='home', servers=[], opened=null, chat=null, es=null, replyTo=null, editing=null, pending=null;
+let me=null, tab='home', servers=[], opened=null, chat=null, es=null, replyTo=null, editing=null, pending=null, dm=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const avatar=(name,cls='')=>'<div class="avatar '+cls+'">'+esc((name||'?')[0].toUpperCase())+'</div>';
 const iconOf=s=>s.icon?esc(s.icon):esc(s.name[0].toUpperCase());
@@ -103,7 +104,12 @@ function listen(){
   es.addEventListener('message',e=>{onIncoming('message',JSON.parse(e.data))});
   es.addEventListener('message-edit',e=>{onIncoming('message-edit',JSON.parse(e.data))});
   es.addEventListener('message-delete',e=>{onIncoming('message-delete',JSON.parse(e.data))});
-  es.onerror=()=>{};
+  es.addEventListener('dm',e=>{onDm('dm',JSON.parse(e.data))});
+  es.addEventListener('dm-edit',e=>{onDm('dm-edit',JSON.parse(e.data))});
+  es.addEventListener('dm-delete',e=>{onDm('dm-delete',JSON.parse(e.data))});
+  es.addEventListener('friend-request',e=>{if(tab==='friends')render()});
+  es.addEventListener('friend-accept',e=>{if(tab==='friends')render()});
+  es.onerror=()=>{/* браузер сам переподключится */};
 }
 function onIncoming(kind,d){
   if(!chat||chat.channel.id!==d.channel_id)return;
@@ -115,6 +121,18 @@ function onIncoming(kind,d){
   if(kind==='message-delete'){
     chat.messages=chat.messages.filter(m=>m.id!==d.id);
     renderThread();
+  }
+}
+function onDm(kind,d){
+  if(!dm||dm.info.id!==d.dm_id)return;
+  if(kind==='dm'){dm.messages.push(d);renderDmThread();dmScroll()}
+  if(kind==='dm-edit'){
+    const i=dm.messages.findIndex(m=>m.id===d.id);
+    if(i>=0){dm.messages[i]=d;renderDmThread()}
+  }
+  if(kind==='dm-delete'){
+    dm.messages=dm.messages.filter(m=>m.id!==d.id);
+    renderDmThread();
   }
 }
 function closeSheet(){document.querySelectorAll('.sheet').forEach(s=>s.remove())}
@@ -150,6 +168,7 @@ async function loadServers(){ servers=await api('/api/servers'); }
 const serverRow=s=>'<div class="row" data-s="'+s.id+'">'+avatar(iconOf(s))+'<div class="grow">'+esc(s.name)+'<small>'+s.members+' '+plural(s.members,'участник','участника','участников')+'</small></div><span class="chip">'+(s.owner?'владелец':'участник')+'</span></div>';
 function plural(n,a,b,c){const m=n%100,k=n%10;if(m>10&&m<20)return c;if(k===1)return a;if(k>1&&k<5)return b;return c}
 async function render(){
+  if(dm) return dmView();
   if(chat) return chatView();
   if(opened) return serverView();
   if(tab==='home'){
@@ -170,7 +189,8 @@ async function render(){
     mk.onclick=createSheet; jn.onclick=joinSheet; bindRows();
     return;
   }
-  if(tab==='chats'||tab==='friends') return shell('<div class="empty">Этот раздел появится на следующем этапе.</div>');
+  if(tab==='friends') return friendsView();
+  if(tab==='chats') return chatsView();
   if(tab==='more') return moreView();
 }
 function chatView(){
@@ -185,15 +205,15 @@ function chatView(){
     '<div class="composer"><button class="btn clip" id="clip">📎</button><textarea id="inp" rows="1" placeholder="Написать в #'+esc(c.name)+'"></textarea><button class="btn" id="send">➤</button>'+
     '<input type="file" id="fpick" style="display:none"></div>'+
     '</div>');
-  bk.onclick=()=>{chat=null;replyTo=null;editing=null;pending=null;render()};
+  bk.onclick=()=>{chat=null;replyTo=null;editing=null;render()};
   renderThread();scrollDown();
   const inp=document.getElementById('inp');
   inp.oninput=()=>{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,110)+'px'};
   inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}};
   send.onclick=sendMessage;
+  q.onchange=()=>searchMessages(q.value.trim());
   clip.onclick=()=>fpick.click();
   fpick.onchange=()=>pickFile(fpick.files[0]);
-  q.onchange=()=>searchMessages(q.value.trim());
   renderReplyBar();renderAttachBar();
 }
 function renderAttachBar(){
@@ -251,7 +271,7 @@ function renderThread(){
         '<div class="who">'+esc(m.username)+(mine?' <span class="when">это ты</span>':'')+'<span class="when">'+new Date(m.created_at).toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'})+(m.edited_at?' · изменено':'')+'</span></div>'+
         (m.text?'<div class="txt">'+esc(m.text)+'</div>':'')+
         (m.file?(m.file.type&&m.file.type.indexOf('image/')===0
-          ?'<img class="msgimg" data-f="'+m.file.id+'" alt="">'
+          ?'<img class="msgimg" data-f="'+m.file.id+'" src="" alt="">'
           :'<span class="msgfile" data-f="'+m.file.id+'">📄 '+esc(m.file.name)+' · '+Math.round(m.file.size/1024)+' КБ</span>'):'')+
       '</div>'+
       '<div class="acts">'+
@@ -269,16 +289,13 @@ function renderThread(){
   });
   box.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>delMessage(b.dataset.d));
   box.querySelectorAll('[data-f]').forEach(el=>{
-    const host=el.closest('[data-m]');
-    const msg=chat.messages.find(x=>x.id===Number(host&&host.dataset.m));
+    const mid=el.closest('[data-m]');
+    const msg=chat.messages.find(x=>x.id===Number(mid&&mid.dataset.m));
     const f=msg&&msg.file;if(!f)return;
+    el.onclick=()=>openAttachment(f.id,f.name,f.type);
     if(el.tagName==='IMG'){
-      api('/api/files/'+f.id).then(d=>{
-        el.src=d.data.indexOf('data:')===0?d.data:('data:'+(f.type||'image/jpeg')+';base64,'+d.data);
-        el.onclick=()=>openAttachment(f.id,f.type);
-      }).catch(()=>{});
-    }else{
-      el.onclick=()=>openAttachment(f.id,f.type);
+      el.onclick=null;
+      api('/api/files/'+f.id).then(d=>{el.src=d.data.indexOf('data:')===0?d.data:('data:'+(f.type||'image/jpeg')+';base64,'+d.data)}).catch(()=>{});
     }
   });
   box.querySelectorAll('[data-go]').forEach(el=>el.onclick=()=>{
@@ -298,11 +315,7 @@ async function sendMessage(){
     }else{
       let fileId=null;
       if(pending){
-        const f=await api('/api/channels/'+chat.channel.id+'/files','POST',{
-          name:pending.name,
-          type:pending.kind==='image'?'image/jpeg':'application/octet-stream',
-          data:pending.body
-        });
+        const f=await api('/api/channels/'+chat.channel.id+'/files','POST',{name:pending.name,type:pending.kind==='image'?'image/jpeg':'application/octet-stream',data:pending.body});
         fileId=f.id;
       }
       await api('/api/channels/'+chat.channel.id+'/messages','POST',{text,reply_to:replyTo?replyTo.id:null,file_id:fileId});
@@ -313,11 +326,11 @@ async function sendMessage(){
   }catch(x){alert(x.message)}
   inp.disabled=false;inp.focus();
 }
-async function openAttachment(id,type){
+async function openAttachment(id,name,type){
   try{
     const f=await api('/api/files/'+id);
     const url=f.data.indexOf('data:')===0?f.data:('data:'+(type||'application/octet-stream')+';base64,'+f.data);
-    const a=document.createElement('a');a.href=url;a.download=f.name;document.body.appendChild(a);a.click();a.remove();
+    const a=document.createElement('a');a.href=url;a.download=name||f.name;document.body.appendChild(a);a.click();a.remove();
   }catch(x){alert(x.message)}
 }
 async function delMessage(id){
@@ -340,6 +353,118 @@ async function openChannel(cid){
     setTimeout(scrollDown,30);
   }catch(x){alert(x.message)}
 }
+async function friendsView(){
+  const d=await api('/api/friends');
+  shell('<h2>Друзья</h2>'+
+    '<button class="btn" id="add">Добавить в друзья</button>'+
+    (d.incoming.length?'<div class="section"><h2>Заявки · '+d.incoming.length+'</h2>'+d.incoming.map(u=>
+      '<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>хочет дружить</small></div>'+
+      '<button class="btn sm" data-ok="'+u.id+'">Принять</button><button class="btn ghost sm" data-no="'+u.id+'">✕</button></div>').join('')+'</div>':'')+
+    (d.outgoing.length?'<div class="section"><h2>Отправленные</h2>'+d.outgoing.map(u=>
+      '<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>ждём ответа</small></div><span class="chip">отправлено</span></div>').join('')+'</div>':'')+
+    '<div class="section"><h2>Мои друзья · '+d.friends.length+'</h2>'+
+    (d.friends.length?d.friends.map(u=>
+      '<div class="row" data-dm="'+u.id+'">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>'+esc(u.bio||'личные сообщения')+'</small></div><span class="chip">написать</span></div>').join('')
+     :'<div class="empty">Друзей пока нет. Нажми «Добавить в друзья» и введи ник.</div>')+'</div>');
+  add.onclick=addFriendSheet;
+  document.querySelectorAll('[data-ok]').forEach(b=>b.onclick=async()=>{
+    try{await api('/api/friends/accept','POST',{id:Number(b.dataset.ok)});render()}catch(x){alert(x.message)}
+  });
+  document.querySelectorAll('[data-no]').forEach(b=>b.onclick=async()=>{
+    try{await api('/api/friends/decline','POST',{id:Number(b.dataset.no)});render()}catch(x){alert(x.message)}
+  });
+  document.querySelectorAll('[data-dm]').forEach(el=>el.onclick=()=>openDmWith(Number(el.dataset.dm)));
+}
+async function chatsView(){
+  const list=await api('/api/dms');
+  shell('<h2>Чаты</h2>'+
+    (list.length?list.map(d=>
+      '<div class="row" data-dm="'+d.id+'">'+avatar(d.with.username)+
+      '<div class="grow">'+esc(d.with.username)+'<small>'+esc(d.last?d.last.text.slice(0,60):'')+'</small></div></div>').join('')
+     :'<div class="empty">Личных переписок пока нет. Добавь друга во вкладке «Друзья».</div>'));
+  document.querySelectorAll('[data-dm]').forEach(el=>el.onclick=()=>openDm(Number(el.dataset.dm)));
+}
+function addFriendSheet(){
+  const d=sheet('<h2>Добавить в друзья</h2><label>Ник друга</label><input name="username" placeholder="латиница, цифры, _ ."><button class="btn" id="ok">Отправить заявку</button><div class="err" id="e"></div>');
+  d.querySelector('#ok').onclick=async()=>{
+    const e=d.querySelector('#e');e.textContent='';
+    try{
+      const r=await api('/api/friends/request','POST',{username:d.querySelector('[name=username]').value.trim()});
+      closeSheet();
+      if(r.accepted) alert('Вы теперь друзья!');
+      tab='friends';render();
+    }catch(x){e.textContent=x.message}
+  };
+}
+async function openDmWith(userId){
+  try{const s=await api('/api/dms/open','POST',{user_id:userId});await openDm(s.id)}
+  catch(x){alert(x.message)}
+}
+async function openDm(id){
+  try{
+    const d=await api('/api/dms/'+id+'/messages?limit=50');
+    dm={info:d.dm,messages:d.messages,has_more:d.has_more};
+    editing=null;
+    render();
+    setTimeout(dmScroll,30);
+  }catch(x){alert(x.message)}
+}
+function dmScroll(){const el=document.querySelector('.msgs');if(el)el.scrollTop=el.scrollHeight}
+function dmView(){
+  const other=dm.info.with;
+  shell(
+    '<div class="row static">'+avatar(other.username)+'<div class="grow"><b>'+esc(other.username)+'</b><small>личная переписка</small></div><span class="chip">● live</span></div>'+
+    '<button class="btn ghost" id="bk">← Назад</button>'+
+    '<div class="chat"><div class="msgs" id="msgs"></div>'+
+    '<div id="replywrap"></div>'+
+    '<div class="composer"><textarea id="inp" rows="1" placeholder="Написать '+esc(other.username)+'"></textarea><button class="btn" id="send">➤</button></div>'+
+    '</div>');
+  bk.onclick=()=>{dm=null;editing=null;render()};
+  const inp=document.getElementById('inp');
+  inp.oninput=()=>{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,110)+'px'};
+  inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendDm()}};
+  send.onclick=sendDm;
+  renderDmThread();dmScroll();
+}
+function renderDmThread(){
+  const box=document.getElementById('msgs');if(!box)return;
+  let last='';
+  box.innerHTML=dm.messages.map(m=>{
+    const d=dayOf(m.created_at);
+    const sep=d!==last?(last=d,'<div class="daysep">'+d+'</div>'):'';
+    const mine=m.user_id===me.id;
+    return sep+'<div class="msg" data-m="'+m.id+'">'+avatar(m.username)+
+      '<div class="bubble"><div class="who">'+esc(m.username)+(mine?' <span class="when">это ты</span>':'')+
+      '<span class="when">'+new Date(m.created_at).toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'})+(m.edited_at?' · изменено':'')+'</span></div>'+
+      '<div class="txt">'+esc(m.text)+'</div></div>'+
+      '<div class="acts">'+(mine?'<button data-de="'+m.id+'">✎</button><button data-dd="'+m.id+'">✕</button>':'')+'</div></div>';
+  }).join('')||'<div class="empty">Напиши первым!</div>';
+  box.querySelectorAll('[data-de]').forEach(b=>b.onclick=()=>{
+    const m=dm.messages.find(x=>x.id===Number(b.dataset.de));
+    editing=m.id;document.getElementById('inp').value=m.text;renderReplyBar();
+  });
+  box.querySelectorAll('[data-dd]').forEach(b=>b.onclick=()=>delDm(b.dataset.dd));
+}
+async function sendDm(){
+  const inp=document.getElementById('inp');
+  const text=inp.value.trim();
+  if(!text)return;
+  inp.disabled=true;
+  try{
+    if(editing){
+      await api('/api/dm-messages/'+editing,'PATCH',{text});
+      editing=null;
+    }else{
+      await api('/api/dms/'+dm.info.id+'/messages','POST',{text});
+    }
+    inp.value='';inp.style.height='auto';renderReplyBar();
+  }catch(x){alert(x.message)}
+  inp.disabled=false;inp.focus();
+}
+async function delDm(id){
+  if(!confirm('Удалить сообщение?'))return;
+  try{await api('/api/dm-messages/'+id,'DELETE')}catch(x){alert(x.message)}
+}
 async function openServer(id){
   try{ opened=await api('/api/servers/'+id); tab='servers'; render(); }
   catch(x){ alert(x.message) }
@@ -354,7 +479,7 @@ async function serverView(){
     '<div class="section"><h2>Текстовые каналы</h2>'+(text.length?text.map(c=>'<div class="row" data-c="'+c.id+'">#<div class="grow">'+esc(c.name)+'</div><span class="chip">открыть</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
     '<div class="section"><h2>Голосовые каналы</h2>'+(voice.length?voice.map(c=>'<div class="row static">🔊<div class="grow">'+esc(c.name)+'</div><span class="chip">голос скоро</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
     (canManage()?'<div class="section"><h2>Управление</h2><button class="btn" id="ac">Создать канал</button><button class="btn ghost" id="iv">Пригласительная ссылка</button><button class="btn ghost" id="rn">Переименовать сервер</button>'+(s.owner?'<button class="btn danger" id="dl">Удалить сервер</button>':'<button class="btn danger" id="lv">Покинуть сервер</button>')+'</div>':'<div class="section"><button class="btn danger" id="lv">Покинуть сервер</button></div>')+
-    '<div class="section"><h2>Участники · '+s.members+'</h2>'+((s.members||[]).length?'':'')+(opened.memberList||[]).map(u=>'<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>'+(u.role==='owner'?'владелец':'участник')+'</small></div></div>').join('')+'</div>'
+    '<div class="section"><h2>Участники · '+s.members+'</h2>'+((s.memberList||[]).map(u=>'<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>'+(u.role==='owner'?'владелец':'участник')+'</small></div></div>').join('')||'')+'</div>'
   );
   bk.onclick=()=>{opened=null;render()};
   document.querySelectorAll('[data-c]').forEach(el=>el.onclick=()=>openChannel(el.dataset.c));
