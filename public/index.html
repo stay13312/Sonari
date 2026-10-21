@@ -53,6 +53,25 @@ h2{font-size:16px;margin-bottom:10px}
 .sheet{position:fixed;inset:0;background:rgba(4,5,15,.7);display:grid;place-items:end center;z-index:40}
 .sheet .card{width:100%;max-width:440px;border-radius:18px 18px 0 0;margin:0}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;word-break:break-all}
+.chat{display:flex;flex-direction:column;height:calc(100vh - 150px);min-height:320px}
+.msgs{flex:1;overflow-y:auto;padding:4px 0 8px;display:flex;flex-direction:column;gap:2px}
+.msg{display:flex;gap:10px;padding:6px 8px;border-radius:10px;position:relative}
+.msg:hover{background:rgba(255,255,255,.03)}
+.msg .bubble{flex:1;min-width:0}
+.msg .who{font-size:13px;font-weight:600;color:#a5a6ff}
+.msg .when{font-size:11px;color:var(--muted);margin-left:6px;font-weight:400}
+.msg .txt{font-size:15px;line-height:1.4;word-wrap:break-word;white-space:pre-wrap;margin-top:2px}
+.msg .acts{display:flex;gap:4px;opacity:0;transition:opacity .15s}
+.msg:hover .acts{opacity:1}
+.msg .acts button{border:0;background:var(--panel2);border-radius:6px;padding:4px 8px;font-size:12px;color:var(--muted);cursor:pointer}
+.msg .reply{border-left:2px solid var(--accent);padding-left:8px;margin-bottom:4px;font-size:12px;color:var(--muted);cursor:pointer}
+.composer{display:flex;gap:8px;padding:10px 0 0;border-top:1px solid var(--line);margin-top:6px}
+.composer textarea{flex:1;resize:none;max-height:110px;padding:11px 13px}
+.composer button{width:auto;margin-top:0;padding:0 18px;border-radius:10px}
+.replybar{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding:6px 8px;background:var(--panel2);border-radius:8px;margin-bottom:6px}
+.replybar button{border:0;background:none;color:var(--muted);cursor:pointer;font-size:14px}
+.daysep{text-align:center;font-size:11px;color:var(--muted);margin:10px 0}
+.searchbox{margin-bottom:8px}
 </style>
 </head>
 <body>
@@ -60,7 +79,7 @@ h2{font-size:16px;margin-bottom:10px}
 <script>
 const LOGO='<svg viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><path fill="url(#g)" d="M16 26C12 18 6 14 2 6c6 0 11 4 14 12 3-8 8-12 14-12-4 8-10 12-14 20z"/></svg>';
 const root=document.getElementById('root');
-let me=null, tab='home', servers=[], opened=null;
+let me=null, tab='home', servers=[], opened=null, chat=null, es=null, replyTo=null, editing=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const avatar=(name,cls='')=>'<div class="avatar '+cls+'">'+esc((name||'?')[0].toUpperCase())+'</div>';
 const iconOf=s=>s.icon?esc(s.icon):esc(s.name[0].toUpperCase());
@@ -71,6 +90,26 @@ async function api(url,method='GET',body){
   return d;
 }
 function form(id){const o={};document.querySelectorAll('#'+id+' [name]').forEach(i=>o[i.name]=i.type==='checkbox'?i.checked:i.value.trim());return o}
+function listen(){
+  if(es) es.close();
+  es=new EventSource('/api/events');
+  es.addEventListener('message',e=>{onIncoming('message',JSON.parse(e.data))});
+  es.addEventListener('message-edit',e=>{onIncoming('message-edit',JSON.parse(e.data))});
+  es.addEventListener('message-delete',e=>{onIncoming('message-delete',JSON.parse(e.data))});
+  es.onerror=()=>{/* браузер сам переподключится */};
+}
+function onIncoming(kind,d){
+  if(!chat||chat.channel.id!==d.channel_id)return;
+  if(kind==='message'){chat.messages.push(d);renderThread();scrollDown()}
+  if(kind==='message-edit'){
+    const i=chat.messages.findIndex(m=>m.id===d.id);
+    if(i>=0){chat.messages[i]=d;renderThread()}
+  }
+  if(kind==='message-delete'){
+    chat.messages=chat.messages.filter(m=>m.id!==d.id);
+    renderThread();
+  }
+}
 function closeSheet(){document.querySelectorAll('.sheet').forEach(s=>s.remove())}
 function sheet(inner){
   closeSheet();
@@ -104,6 +143,7 @@ async function loadServers(){ servers=await api('/api/servers'); }
 const serverRow=s=>'<div class="row" data-s="'+s.id+'">'+avatar(iconOf(s))+'<div class="grow">'+esc(s.name)+'<small>'+s.members+' '+plural(s.members,'участник','участника','участников')+'</small></div><span class="chip">'+(s.owner?'владелец':'участник')+'</span></div>';
 function plural(n,a,b,c){const m=n%100,k=n%10;if(m>10&&m<20)return c;if(k===1)return a;if(k>1&&k<5)return b;return c}
 async function render(){
+  if(chat) return chatView();
   if(opened) return serverView();
   if(tab==='home'){
     await loadServers();
@@ -126,7 +166,102 @@ async function render(){
   if(tab==='chats'||tab==='friends') return shell('<div class="empty">Этот раздел появится на следующем этапе.</div>');
   if(tab==='more') return moreView();
 }
+function chatView(){
+  const c=chat.channel;
+  shell(
+    '<div class="row static"><div class="grow"><b># '+esc(c.name)+'</b><small>'+esc((opened&&opened.name)||'')+'</small></div><span class="chip" id="live">● live</span></div>'+
+    '<button class="btn ghost" id="bk">← К каналам</button>'+
+    '<div class="searchbox"><input id="q" placeholder="Поиск по сообщениям"></div>'+
+    '<div class="chat"><div class="msgs" id="msgs"></div>'+
+    '<div id="replywrap"></div>'+
+    '<div class="composer"><textarea id="inp" rows="1" placeholder="Написать в #'+esc(c.name)+'"></textarea><button class="btn" id="send">➤</button></div>'+
+    '</div>');
+  bk.onclick=()=>{chat=null;replyTo=null;editing=null;render()};
+  renderThread();scrollDown();
+  const inp=document.getElementById('inp');
+  inp.oninput=()=>{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,110)+'px'};
+  inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage()}};
+  send.onclick=sendMessage;
+  q.onchange=()=>searchMessages(q.value.trim());
+  renderReplyBar();
+}
+function renderReplyBar(){
+  const w=document.getElementById('replywrap');if(!w)return;
+  if(editing){w.innerHTML='<div class="replybar">Правка сообщения<button id="cx">✕</button></div>';cx.onclick=()=>{editing=null;document.getElementById('inp').value='';renderReplyBar()};return}
+  if(replyTo){w.innerHTML='<div class="replybar">Ответ '+esc(replyTo.username)+': '+esc(replyTo.text.slice(0,60))+'<button id="cx">✕</button></div>';cx.onclick=()=>{replyTo=null;renderReplyBar()};return}
+  w.innerHTML='';
+}
+function dayOf(ts){return new Date(ts).toLocaleDateString('ru',{day:'numeric',month:'long'})}
+function renderThread(){
+  const box=document.getElementById('msgs');if(!box)return;
+  let last='';
+  box.innerHTML=chat.messages.map(m=>{
+    const d=dayOf(m.created_at);
+    const sep=d!==last?(last=d,'<div class="daysep">'+d+'</div>'):'';
+    const mine=m.user_id===me.id;
+    return sep+'<div class="msg" data-m="'+m.id+'">'+avatar(m.username)+
+      '<div class="bubble">'+
+        (m.reply_to?'<div class="reply" data-go="'+m.reply_to+'">'+esc(m.reply_username)+': '+esc(m.reply_text||'')+'</div>':'')+
+        '<div class="who">'+esc(m.username)+(mine?' <span class="when">это ты</span>':'')+'<span class="when">'+new Date(m.created_at).toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'})+(m.edited_at?' · изменено':'')+'</span></div>'+
+        '<div class="txt">'+esc(m.text)+'</div>'+
+      '</div>'+
+      '<div class="acts">'+
+        '<button data-r="'+m.id+'">↩</button>'+
+        (mine?'<button data-e="'+m.id+'">✎</button><button data-d="'+m.id+'">✕</button>':'')+
+      '</div></div>';
+  }).join('')||'<div class="empty">Сообщений пока нет. Напиши первым!</div>';
+  box.querySelectorAll('[data-r]').forEach(b=>b.onclick=()=>{
+    const m=chat.messages.find(x=>x.id===Number(b.dataset.r));
+    replyTo={id:m.id,username:m.username,text:m.text};editing=null;renderReplyBar();
+  });
+  box.querySelectorAll('[data-e]').forEach(b=>b.onclick=()=>{
+    const m=chat.messages.find(x=>x.id===Number(b.dataset.e));
+    editing=m.id;replyTo=null;document.getElementById('inp').value=m.text;renderReplyBar();
+  });
+  box.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>delMessage(b.dataset.d));
+  box.querySelectorAll('[data-go]').forEach(el=>el.onclick=()=>{
+    const t=document.querySelector('[data-m="'+el.dataset.go+'"]');
+    if(t){t.scrollIntoView({block:'center'});t.style.background='rgba(91,92,246,.15)';setTimeout(()=>t.style.background='',900)}
+  });
+}
+async function sendMessage(){
+  const inp=document.getElementById('inp');
+  const text=inp.value.trim();
+  if(!text)return;
+  inp.disabled=true;
+  try{
+    if(editing){
+      await api('/api/messages/'+editing,'PATCH',{text});
+      editing=null;
+    }else{
+      await api('/api/channels/'+chat.channel.id+'/messages','POST',{text,reply_to:replyTo?replyTo.id:null});
+      replyTo=null;
+    }
+    inp.value='';inp.style.height='auto';
+    renderReplyBar();
+  }catch(x){alert(x.message)}
+  inp.disabled=false;inp.focus();
+}
+async function delMessage(id){
+  if(!confirm('Удалить сообщение?'))return;
+  try{await api('/api/messages/'+id,'DELETE')}catch(x){alert(x.message)}
+}
+async function searchMessages(q){
+  if(!q){const d=await api('/api/channels/'+chat.channel.id+'/messages?limit=50');chat.messages=d.messages;renderThread();scrollDown();return}
+  const r=await api('/api/channels/'+chat.channel.id+'/search?q='+encodeURIComponent(q));
+  chat.messages=r.messages;renderThread();
+}
 function bindRows(){document.querySelectorAll('[data-s]').forEach(el=>el.onclick=()=>openServer(el.dataset.s))}
+function scrollDown(){const el=document.querySelector('.msgs');if(el)el.scrollTop=el.scrollHeight}
+async function openChannel(cid){
+  try{
+    const d=await api('/api/channels/'+cid+'/messages?limit=50');
+    chat={channel:d.channel,messages:d.messages,has_more:d.has_more};
+    replyTo=null;editing=null;
+    render();
+    setTimeout(scrollDown,30);
+  }catch(x){alert(x.message)}
+}
 async function openServer(id){
   try{ opened=await api('/api/servers/'+id); tab='servers'; render(); }
   catch(x){ alert(x.message) }
@@ -138,11 +273,13 @@ async function serverView(){
   shell(
     '<div class="row static"><div class="avatar">'+iconOf(s)+'</div><div class="grow"><b>'+esc(s.name)+'</b><small>'+s.members+' '+plural(s.members,'участник','участника','участников')+' · '+(s.myRole==='owner'?'владелец':'участник')+'</small></div></div>'+
     '<button class="btn ghost" id="bk">← Назад к списку</button>'+
-    '<div class="section"><h2>Текстовые каналы</h2>'+(text.length?text.map(c=>'<div class="row static">#<div class="grow">'+esc(c.name)+'</div><span class="chip">чат скоро</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
+    '<div class="section"><h2>Текстовые каналы</h2>'+(text.length?text.map(c=>'<div class="row" data-c="'+c.id+'">#<div class="grow">'+esc(c.name)+'</div><span class="chip">открыть</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
     '<div class="section"><h2>Голосовые каналы</h2>'+(voice.length?voice.map(c=>'<div class="row static">🔊<div class="grow">'+esc(c.name)+'</div><span class="chip">голос скоро</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
-    (canManage()?'<div class="section"><h2>Управление</h2><button class="btn" id="ac">Создать канал</button><button class="btn ghost" id="iv">Пригласительная ссылка</button><button class="btn ghost" id="rn">Переименовать сервер</button>'+(s.owner?'<button class="btn danger" id="dl">Удалить сервер</button>':'<button class="btn danger" id="lv">Покинуть сервер</button>')+'</div>':'<div class="section"><button class="btn danger" id="lv">Покинуть сервер</button></div>')
+    (canManage()?'<div class="section"><h2>Управление</h2><button class="btn" id="ac">Создать канал</button><button class="btn ghost" id="iv">Пригласительная ссылка</button><button class="btn ghost" id="rn">Переименовать сервер</button>'+(s.owner?'<button class="btn danger" id="dl">Удалить сервер</button>':'<button class="btn danger" id="lv">Покинуть сервер</button>')+'</div>':'<div class="section"><button class="btn danger" id="lv">Покинуть сервер</button></div>')+
+    '<div class="section"><h2>Участники · '+s.members+'</h2>'+(s.members||[]).map(u=>'<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>'+(u.role==='owner'?'владелец':'участник')+'</small></div></div>').join('')+'</div>'
   );
   bk.onclick=()=>{opened=null;render()};
+  document.querySelectorAll('[data-c]').forEach(el=>el.onclick=()=>openChannel(el.dataset.c));
   if(document.getElementById('ac')) ac.onclick=addChannelSheet;
   if(document.getElementById('iv')) iv.onclick=inviteSheet;
   if(document.getElementById('rn')) rn.onclick=renameSheet;
@@ -204,6 +341,7 @@ async function deleteServer(){
   try{await api('/api/servers/'+opened.id,'DELETE');opened=null;await loadServers();render();}
   catch(x){alert(x.message)}
 }
+function device(ua=''){if(/iPhone|iPad/.test(ua))return 'iOS';if(/Android/.test(ua))return 'Android';if(/Windows/.test(ua))return 'Windows';if(/Mac/.test(ua))return 'macOS';if(/Linux/.test(ua))return 'Linux';return 'Устройство'}
 async function moreView(){
   shell('<div class="card" style="text-align:center">'+avatar(me.username,'big')+'<h1 style="margin-top:10px">'+esc(me.username)+'</h1><p class="sub">'+esc(me.email)+'</p></div>'+
   '<div class="section"><h2>Профиль</h2><div class="card" id="pf"><label>Ник</label><input name="username" value="'+esc(me.username)+'"><label>О себе</label><textarea name="bio" rows="3" maxlength="190">'+esc(me.bio)+'</textarea><button class="btn" id="sp">Сохранить</button><div class="err" id="pe"></div></div></div>'+
@@ -221,9 +359,8 @@ async function loadSessions(){
   const list=await api('/api/sessions');
   document.getElementById('ss').innerHTML=list.map(s=>'<div class="row static">📱<div class="grow">'+esc(device(s.user_agent))+'<small>'+new Date(s.created_at).toLocaleString('ru')+'</small></div>'+(s.current?'<span class="badge">это устройство</span>':'')+'</div>').join('');
 }
-function device(ua=''){if(/iPhone|iPad/.test(ua))return 'iOS';if(/Android/.test(ua))return 'Android';if(/Windows/.test(ua))return 'Windows';if(/Mac/.test(ua))return 'macOS';if(/Linux/.test(ua))return 'Linux';return 'Устройство'}
 async function boot(){
-  try{ me=await api('/api/me'); await loadServers(); const inv=new URLSearchParams(location.search).get('inv');
+  try{ me=await api('/api/me'); listen(); await loadServers(); const inv=new URLSearchParams(location.search).get('inv');
     if(inv){ try{ const r=await api('/api/join/'+encodeURIComponent(inv),'POST'); history.replaceState({},'','/'); tab='servers'; await loadServers(); await openServer(r.id); return; }catch(x){ alert(x.message) } }
     tab='home'; render();
   }catch{ authView() }
