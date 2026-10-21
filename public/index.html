@@ -80,6 +80,11 @@ h2{font-size:16px;margin-bottom:10px}
 .attach button{border:0;background:none;color:var(--muted);cursor:pointer;font-size:15px}
 .msgimg{max-width:100%;max-height:280px;border-radius:10px;margin-top:6px;display:block;cursor:pointer}
 .msgfile{display:inline-flex;align-items:center;gap:8px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin-top:6px;font-size:13px;cursor:pointer;color:var(--text)}
+.voice-people{font-size:12px;color:var(--muted);padding:2px 0 0 34px}
+.dot{width:8px;height:8px;border-radius:50%;background:#22c55e;flex-shrink:0}
+.dot.off{background:#8a90c0}
+.vbtn{width:auto;margin-top:0;padding:10px 14px;font-size:14px}
+.vrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
 </style>
 </head>
 <body>
@@ -88,6 +93,7 @@ h2{font-size:16px;margin-bottom:10px}
 const LOGO='<svg viewBox="0 0 32 32"><defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><path fill="url(#g)" d="M16 26C12 18 6 14 2 6c6 0 11 4 14 12 3-8 8-12 14-12-4 8-10 12-14 20z"/></svg>';
 const root=document.getElementById('root');
 let me=null, tab='home', servers=[], opened=null, chat=null, es=null, replyTo=null, editing=null, pending=null, dm=null;
+let voiceRooms={}, voiceHere={id:null,name:''}, micStream=null, pcs={}, pushing=false;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const avatar=(name,cls='')=>'<div class="avatar '+cls+'">'+esc((name||'?')[0].toUpperCase())+'</div>';
 const iconOf=s=>s.icon?esc(s.icon):esc(s.name[0].toUpperCase());
@@ -109,7 +115,9 @@ function listen(){
   es.addEventListener('dm-delete',e=>{onDm('dm-delete',JSON.parse(e.data))});
   es.addEventListener('friend-request',e=>{if(tab==='friends')render()});
   es.addEventListener('friend-accept',e=>{if(tab==='friends')render()});
-  es.onerror=()=>{/* браузер сам переподключится */};
+  es.addEventListener('voice',e=>{refreshVoice()});
+  es.addEventListener('voice-signal',e=>{onSignal(JSON.parse(e.data))});
+  es.onerror=()=>{};
 }
 function onIncoming(kind,d){
   if(!chat||chat.channel.id!==d.channel_id)return;
@@ -134,6 +142,100 @@ function onDm(kind,d){
     dm.messages=dm.messages.filter(m=>m.id!==d.id);
     renderDmThread();
   }
+}
+async function refreshVoice(){
+  if(!opened)return;
+  try{ voiceRooms=await api('/api/servers/'+opened.id+'/voice'); if(tab==='servers')render() }catch(e){}
+}
+function someoneInChannel(cid){
+  const list=voiceRooms[cid]||[];
+  if(!list.length)return '';
+  return '<div class="voice-people">'+list.map(v=>(v.muted?'🔇 ':'🎙 ')+esc(v.username)).join(' · ')+'</div>';
+}
+async function joinVoice(cid,name){
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia) return alert('Браузер не даёт доступ к микрофону. Нужен HTTPS.');
+    micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  }catch(e){ return alert('Нет доступа к микрофону. Разреши его в настройках браузера.') }
+  await api('/api/channels/'+cid+'/voice/join','POST');
+  voiceHere={id:cid,name};
+  micStream.getAudioTracks().forEach(t=>{t.enabled=false});
+  voicePanel();
+}
+async function leaveVoice(){
+  if(voiceHere.id){ try{ await api('/api/channels/'+voiceHere.id+'/voice/leave','POST') }catch(e){} }
+  Object.values(pcs).forEach(pc=>{try{pc.close()}catch(e){}});
+  pcs={};
+  if(micStream){ micStream.getTracks().forEach(t=>t.stop()); micStream=null }
+  voiceHere={id:null,name:''};pushing=false;
+  const box=document.getElementById('voicepanel'); if(box)box.remove();
+  refreshVoice();
+}
+async function onSignal(msg){
+  if(!voiceHere.id||msg.channel_id!==voiceHere.id)return;
+  if(msg.kind==='offer'){
+    const pc=newPeer(msg.from,false);
+    await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+    const answer=await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await api('/api/channels/'+voiceHere.id+'/voice/signal','POST',{to:msg.from,kind:'answer',data:{type:answer.type,sdp:answer.sdp}});
+  }
+  if(msg.kind==='answer'){
+    const pc=pcs[msg.from]; if(pc) await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+  }
+  if(msg.kind==='ice'){
+    const pc=pcs[msg.from]; if(pc&&msg.data){ try{ await pc.addIceCandidate(new RTCIceCandidate(msg.data)) }catch(e){} }
+  }
+  if(msg.kind==='bye'){
+    const pc=pcs[msg.from]; if(pc){try{pc.close()}catch(e){} delete pcs[msg.from]}
+  }
+}
+function newPeer(peerId,makeOffer){
+  const pc=pcs[peerId] || new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  pcs[peerId]=pc;
+  if(micStream) micStream.getTracks().forEach(t=>pc.addTrack(t,micStream));
+  pc.onicecandidate=e=>{ if(e.candidate) api('/api/channels/'+voiceHere.id+'/voice/signal','POST',{to:peerId,kind:'ice',data:e.candidate}).catch(()=>{}) };
+  pc.ontrack=e=>{ attachAudio(peerId,e.streams[0]) };
+  if(makeOffer){
+    pc.onnegotiationneeded=async()=>{
+      try{
+        const offer=await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await api('/api/channels/'+voiceHere.id+'/voice/signal','POST',{to:peerId,kind:'offer',data:{type:offer.type,sdp:offer.sdp}});
+      }catch(e){}
+    };
+  }
+  return pc;
+}
+function attachAudio(peerId,stream){
+  let el=document.getElementById('audio-'+peerId);
+  if(!el){
+    el=document.createElement('audio');
+    el.id='audio-'+peerId; el.autoplay=true; el.playsInline=true;
+    document.body.appendChild(el);
+  }
+  el.srcObject=stream;
+  voicePanel();
+}
+function voicePanel(){
+  const old=document.getElementById('voicepanel'); if(old)old.remove();
+  if(!voiceHere.id)return;
+  const list=(voiceRooms[voiceHere.id]||[]);
+  const box=document.createElement('div');
+  box.id='voicepanel';
+  box.style.cssText='position:fixed;left:12px;right:12px;bottom:78px;z-index:30;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.45)';
+  box.innerHTML='<div style="display:flex;align-items:center;gap:8px;font-size:13px"><span class="dot"></span><b>'+esc(voiceHere.name)+'</b>'+
+    '<span style="color:var(--muted);margin-left:auto">'+(pushing?'говоришь':'микрофон выключен')+'</span></div>'+
+    '<div class="voice-people">'+list.map(v=>esc(v.username)+(v.user_id===me.id?' (ты)':'')+(v.muted?' 🔇':' 🎙')).join(' · ')+'</div>'+
+    '<div class="vrow"><button class="btn vbtn" id="ptt">🎤 Держать для речи</button>'+
+    '<button class="btn ghost vbtn" id="vm">Выйти</button></div>';
+  document.body.appendChild(box);
+  const b=box.querySelector('#ptt');
+  const down=e=>{e.preventDefault();pushing=true;if(micStream)micStream.getAudioTracks().forEach(t=>{t.enabled=true});voicePanel()};
+  const up=()=>{pushing=false;if(micStream)micStream.getAudioTracks().forEach(t=>{t.enabled=false});voicePanel()};
+  b.addEventListener('mousedown',down); b.addEventListener('mouseup',up); b.addEventListener('mouseleave',up);
+  b.addEventListener('touchstart',down,{passive:false}); b.addEventListener('touchend',up); b.addEventListener('touchcancel',up);
+  box.querySelector('#vm').onclick=leaveVoice;
 }
 function closeSheet(){document.querySelectorAll('.sheet').forEach(s=>s.remove())}
 function sheet(inner){
@@ -466,7 +568,11 @@ async function delDm(id){
   try{await api('/api/dm-messages/'+id,'DELETE')}catch(x){alert(x.message)}
 }
 async function openServer(id){
-  try{ opened=await api('/api/servers/'+id); tab='servers'; render(); }
+  try{
+    opened=await api('/api/servers/'+id); tab='servers'; render();
+    try{ voiceRooms=await api('/api/servers/'+id+'/voice'); if(opened&&tab==='servers') render(); }catch(e){}
+    if(voiceHere.id) voicePanel();
+  }
   catch(x){ alert(x.message) }
 }
 async function serverView(){
@@ -477,12 +583,17 @@ async function serverView(){
     '<div class="row static"><div class="avatar">'+iconOf(s)+'</div><div class="grow"><b>'+esc(s.name)+'</b><small>'+s.members+' '+plural(s.members,'участник','участника','участников')+' · '+(s.myRole==='owner'?'владелец':'участник')+'</small></div></div>'+
     '<button class="btn ghost" id="bk">← Назад к списку</button>'+
     '<div class="section"><h2>Текстовые каналы</h2>'+(text.length?text.map(c=>'<div class="row" data-c="'+c.id+'">#<div class="grow">'+esc(c.name)+'</div><span class="chip">открыть</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
-    '<div class="section"><h2>Голосовые каналы</h2>'+(voice.length?voice.map(c=>'<div class="row static">🔊<div class="grow">'+esc(c.name)+'</div><span class="chip">голос скоро</span></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
+    '<div class="section"><h2>Голосовые каналы</h2>'+(voice.length?voice.map(c=>'<div class="row static" style="flex-wrap:wrap">🔊<div class="grow">'+esc(c.name)+'</div>'+
+      (voiceHere.id===c.id?'<button class="btn vbtn" data-vl="'+c.id+'">Выйти</button>':'<button class="btn vbtn" data-vj="'+c.id+'" data-vn="'+esc(c.name)+'">Зайти</button>')+
+      '<div style="flex-basis:100%">'+someoneInChannel(c.id)+'</div></div>').join(''):'<div class="empty">Каналов нет</div>')+'</div>'+
     (canManage()?'<div class="section"><h2>Управление</h2><button class="btn" id="ac">Создать канал</button><button class="btn ghost" id="iv">Пригласительная ссылка</button><button class="btn ghost" id="rn">Переименовать сервер</button>'+(s.owner?'<button class="btn danger" id="dl">Удалить сервер</button>':'<button class="btn danger" id="lv">Покинуть сервер</button>')+'</div>':'<div class="section"><button class="btn danger" id="lv">Покинуть сервер</button></div>')+
-    '<div class="section"><h2>Участники · '+s.members+'</h2>'+((s.memberList||[]).map(u=>'<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>'+(u.role==='owner'?'владелец':'участник')+'</small></div></div>').join('')||'')+'</div>'
+    '<div class="section"><h2>Участники · '+s.members+'</h2>'+((s.members||[]).length?((s.memberList||[]).map(u=>'<div class="row static">'+avatar(u.username)+'<div class="grow">'+esc(u.username)+'<small>'+(u.role==='owner'?'владелец':'участник')+'</small></div></div>').join('')):'')+'</div>'
   );
   bk.onclick=()=>{opened=null;render()};
   document.querySelectorAll('[data-c]').forEach(el=>el.onclick=()=>openChannel(el.dataset.c));
+  document.querySelectorAll('[data-vj]').forEach(el=>el.onclick=()=>joinVoice(Number(el.dataset.vj),el.dataset.vn));
+  document.querySelectorAll('[data-vl]').forEach(el=>el.onclick=()=>leaveVoice());
+  refreshVoice();
   if(document.getElementById('ac')) ac.onclick=addChannelSheet;
   if(document.getElementById('iv')) iv.onclick=inviteSheet;
   if(document.getElementById('rn')) rn.onclick=renameSheet;
@@ -536,11 +647,13 @@ function renameSheet(){
 }
 async function leaveServer(){
   if(!confirm('Покинуть сервер «'+opened.name+'»?'))return;
+  await leaveVoice();
   try{await api('/api/servers/'+opened.id+'/leave','POST');opened=null;await loadServers();render();}
   catch(x){alert(x.message)}
 }
 async function deleteServer(){
   if(!confirm('Удалить сервер «'+opened.name+'» вместе со всеми каналами? Это необратимо.'))return;
+  await leaveVoice();
   try{await api('/api/servers/'+opened.id,'DELETE');opened=null;await loadServers();render();}
   catch(x){alert(x.message)}
 }
@@ -554,8 +667,8 @@ async function moreView(){
   sp.onclick=async()=>{pe.textContent='';try{me=await api('/api/me','PATCH',form('pf'));pe.innerHTML='<span class="okmsg">Сохранено</span>'}catch(x){pe.textContent=x.message}};
   cp.onclick=async()=>{we.textContent='';try{await api('/api/password','POST',form('pw'));we.innerHTML='<span class="okmsg">Пароль изменён, другие устройства отключены</span>'}catch(x){we.textContent=x.message}};
   la.onclick=async()=>{await api('/api/logout-all','POST');loadSessions()};
-  lo.onclick=async()=>{await api('/api/logout','POST');me=null;authView()};
-  del.onclick=async()=>{const p=prompt('Введи пароль для удаления аккаунта. Это необратимо.');if(!p)return;try{await api('/api/me','DELETE',{password:p});me=null;authView()}catch(x){alert(x.message)}};
+  lo.onclick=async()=>{await leaveVoice();await api('/api/logout','POST');me=null;authView()};
+  del.onclick=async()=>{const p=prompt('Введи пароль для удаления аккаунта. Это необратимо.');if(!p)return;try{await leaveVoice();await api('/api/me','DELETE',{password:p});me=null;authView()}catch(x){alert(x.message)}};
   loadSessions();
 }
 async function loadSessions(){
