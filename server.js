@@ -1,4 +1,4 @@
-// Sonari — этапы 1–3: аккаунты, серверы, каналы, сообщения
+// Sonari — этапы 1–4: аккаунты, серверы, каналы, сообщения, файлы
 // База: хранилище на массивах + файл sonari.json (без нативных модулей)
 const express = require('express');
 const bcrypt = require('bcryptjs');
@@ -10,8 +10,8 @@ const app = express();
 const DB_FILE = path.join(__dirname, 'sonari.json');
 
 const store = {
-  users: [], sessions: [], servers: [], members: [], channels: [], messages: [],
-  seq: { users: 1, sessions: 1, servers: 1, channels: 1, messages: 1 }
+  users: [], sessions: [], servers: [], members: [], channels: [], messages: [], files: [],
+  seq: { users: 1, sessions: 1, servers: 1, channels: 1, messages: 1, files: 1 }
 };
 
 const db = {
@@ -49,6 +49,7 @@ const db = {
       const chans = store.channels.filter(c => c.server_id === sid).map(c => c.id);
       store.channels = store.channels.filter(c => c.server_id !== sid);
       store.messages = store.messages.filter(m => !chans.includes(m.channel_id));
+      store.files = store.files.filter(f => f.server_id !== sid);
     }
   },
   members: {
@@ -77,13 +78,19 @@ const db = {
     update: (id, patch) => { const r = store.messages.find(m => m.id === Number(id)); if (r) Object.assign(r, patch); },
     remove: id => { store.messages = store.messages.filter(m => m.id !== Number(id)); }
   },
+  files: {
+    byId: id => store.files.find(f => f.id === Number(id)),
+    byServer: sid => store.files.filter(f => f.server_id === Number(sid)),
+    insert: o => { const id = store.seq.files++; const row = Object.assign({ id }, o); store.files.push(row); return row; },
+    remove: id => { store.files = store.files.filter(f => f.id !== Number(id)); }
+  },
   save: () => {
     try { fs.writeFileSync(DB_FILE, JSON.stringify(store)); } catch (e) { /* диск только для чтения */ }
   }
 };
 
 // --- живая доставка событий (Server-Sent Events) ---
-const listeners = new Map(); // userId -> Set(res)
+const listeners = new Map();
 function subscribe(userId, res) {
   if (!listeners.has(userId)) listeners.set(userId, new Set());
   listeners.get(userId).add(res);
@@ -110,7 +117,7 @@ if (fs.existsSync(DB_FILE)) {
 setInterval(() => db.save(), 5000);
 
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '100kb' }));
+app.use(express.json({ limit: '8mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const DAY = 86400000;
@@ -356,12 +363,14 @@ function channelAccess(channelId, userId) {
 function publicMessage(m) {
   const u = db.users.byId(m.user_id) || {};
   const parent = m.reply_to ? db.messages.byId(m.reply_to) : null;
+  const f = m.file_id ? db.files.byId(m.file_id) : null;
   return {
     id: m.id, channel_id: m.channel_id, user_id: m.user_id,
     username: u.username || '?', text: m.text,
     reply_to: m.reply_to || null,
     reply_text: parent ? parent.text.slice(0, 90) : null,
     reply_username: parent ? ((db.users.byId(parent.user_id) || {}).username || '?') : null,
+    file: f ? { id: f.id, name: f.name, type: f.type, size: f.size } : null,
     created_at: m.created_at, edited_at: m.edited_at || null
   };
 }
@@ -387,14 +396,16 @@ app.post('/api/channels/:id/messages', auth, (req, res) => {
   if (acc.error) return res.status(403).json({ error: acc.error });
   if (acc.channel.type !== 'text') return res.status(400).json({ error: 'В голосовой канал писать нельзя' });
   const text = String((req.body || {}).text || '').trim();
-  if (!text) return res.status(400).json({ error: 'Сообщение не может быть пустым' });
+  const hasFile = !!(req.body || {}).file_id;
+  if (!text && !hasFile) return res.status(400).json({ error: 'Сообщение не может быть пустым' });
   if (text.length > 2000) return res.status(400).json({ error: 'Слишком длинное сообщение (максимум 2000)' });
   let replyTo = null;
   if ((req.body || {}).reply_to) {
     const parent = db.messages.byId(req.body.reply_to);
     if (parent && parent.channel_id === acc.channel.id) replyTo = parent.id;
   }
-  const m = db.messages.insert({ channel_id: acc.channel.id, user_id: req.user.id, text, reply_to: replyTo, created_at: Date.now(), edited_at: null });
+  const fileId = (req.body || {}).file_id ? Number(req.body.file_id) : null;
+  const m = db.messages.insert({ channel_id: acc.channel.id, user_id: req.user.id, text, reply_to: replyTo, file_id: fileId, created_at: Date.now(), edited_at: null });
   db.save();
   const out = publicMessage(m);
   emitTo(serverAudience(acc.channel.server_id), 'message', out);
@@ -424,6 +435,7 @@ app.delete('/api/messages/:id', auth, (req, res) => {
   if (acc.error) return res.status(403).json({ error: acc.error });
   const canModerate = acc.member.role === 'owner' || acc.member.role === 'admin';
   if (m.user_id !== req.user.id && !canModerate) return res.status(403).json({ error: 'Можно удалять только свои сообщения' });
+  if (m.file_id) db.files.remove(m.file_id);
   db.messages.remove(m.id);
   db.save();
   emitTo(serverAudience(acc.channel.server_id), 'message-delete', { id: m.id, channel_id: m.channel_id });
@@ -437,6 +449,32 @@ app.get('/api/channels/:id/search', auth, (req, res) => {
   if (!q) return res.json({ messages: [] });
   const found = db.messages.byChannel(acc.channel.id).filter(m => m.text.toLowerCase().includes(q)).slice(-50);
   res.json({ messages: found.map(publicMessage) });
+});
+
+// ---------- файлы ----------
+app.post('/api/channels/:id/files', auth, (req, res) => {
+  const acc = channelAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  const name = String((req.body || {}).name || 'файл').replace(/[\/\\]/g, '_').slice(0, 120);
+  const type = String((req.body || {}).type || 'application/octet-stream').slice(0, 80);
+  const data = String((req.body || {}).data || '');
+  const mm = data.match(/^data:[^;]+;base64,(.*)$/);
+  if (!mm) return res.status(400).json({ error: 'Некорректный файл' });
+  const buf = Buffer.from(mm[1], 'base64');
+  if (buf.length > 5 * 1024 * 1024) return res.status(413).json({ error: 'Файл больше 5 МБ' });
+  const f = db.files.insert({
+    server_id: acc.channel.server_id, channel_id: acc.channel.id,
+    user_id: req.user.id, name, type, size: buf.length, data: mm[1], created_at: Date.now()
+  });
+  db.save();
+  res.json({ id: f.id, name: f.name, type: f.type, size: f.size });
+});
+
+app.get('/api/files/:id', auth, (req, res) => {
+  const f = db.files.byId(req.params.id);
+  if (!f) return res.status(404).json({ error: 'Файл не найден' });
+  if (!db.members.get(f.server_id, req.user.id)) return res.status(403).json({ error: 'Нет доступа к файлу' });
+  res.json({ id: f.id, name: f.name, type: f.type, size: f.size, data: f.data });
 });
 
 // ---------- каналы ----------
