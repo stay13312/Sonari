@@ -1,5 +1,5 @@
-// Sonari — этапы 1–4: аккаунты, серверы, каналы, сообщения, файлы
-// База: хранилище на массивах + файл sonari.json (без нативных модулей)
+// Sonari — этапы 1–4: аккаунты, серверы, каналы, сообщения, файлы, друзья, личные сообщения
+// База: простое хранилище на массивах + файл sonari.json (без нативных модулей)
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
@@ -11,7 +11,8 @@ const DB_FILE = path.join(__dirname, 'sonari.json');
 
 const store = {
   users: [], sessions: [], servers: [], members: [], channels: [], messages: [], files: [],
-  seq: { users: 1, sessions: 1, servers: 1, channels: 1, messages: 1, files: 1 }
+  friends: [], dms: [], dmMessages: [],
+  seq: { users: 1, sessions: 1, servers: 1, channels: 1, messages: 1, files: 1, dms: 1, dmMessages: 1 }
 };
 
 const db = {
@@ -84,6 +85,33 @@ const db = {
     insert: o => { const id = store.seq.files++; const row = Object.assign({ id }, o); store.files.push(row); return row; },
     remove: id => { store.files = store.files.filter(f => f.id !== Number(id)); }
   },
+  friends: {
+    pair: (a, b) => store.friends.find(f =>
+      (f.from === Number(a) && f.to === Number(b)) || (f.from === Number(b) && f.to === Number(a))),
+    incoming: uid => store.friends.filter(f => f.to === Number(uid) && f.status === 'pending'),
+    outgoing: uid => store.friends.filter(f => f.from === Number(uid) && f.status === 'pending'),
+    accepted: uid => store.friends.filter(f => f.status === 'accepted' &&
+      (f.from === Number(uid) || f.to === Number(uid))),
+    add: o => { store.friends.push(o); },
+    remove: (a, b) => { store.friends = store.friends.filter(f =>
+      !((f.from === Number(a) && f.to === Number(b)) || (f.from === Number(b) && f.to === Number(a)))); }
+  },
+  dms: {
+    byId: id => store.dms.find(d => d.id === Number(id)),
+    between: (a, b) => store.dms.find(d =>
+      (d.user_a === Number(a) && d.user_b === Number(b)) || (d.user_a === Number(b) && d.user_b === Number(a))),
+    forUser: uid => store.dms.filter(d => d.user_a === Number(uid) || d.user_b === Number(uid)),
+    insert: o => { const id = store.seq.dms++; const row = Object.assign({ id }, o); store.dms.push(row); return row; },
+    remove: id => { store.dms = store.dms.filter(d => d.id !== Number(id)); }
+  },
+  dmMessages: {
+    byId: id => store.dmMessages.find(m => m.id === Number(id)),
+    byDm: did => store.dmMessages.filter(m => m.dm_id === Number(did))
+      .sort((a, b) => a.created_at - b.created_at || a.id - b.id),
+    insert: o => { const id = store.seq.dmMessages++; const row = Object.assign({ id }, o); store.dmMessages.push(row); return row; },
+    update: (id, patch) => { const r = store.dmMessages.find(m => m.id === Number(id)); if (r) Object.assign(r, patch); },
+    remove: id => { store.dmMessages = store.dmMessages.filter(m => m.id !== Number(id)); }
+  },
   save: () => {
     try { fs.writeFileSync(DB_FILE, JSON.stringify(store)); } catch (e) { /* диск только для чтения */ }
   }
@@ -105,6 +133,9 @@ function emitTo(userIds, event, data) {
     const set = listeners.get(Number(uid));
     if (set) set.forEach(res => { try { res.write(payload); } catch (e) {} });
   });
+}
+function notifyUser(userId, event, data) {
+  emitTo([Number(userId)], event, data);
 }
 function serverAudience(serverId) {
   return store.members.filter(m => m.server_id === Number(serverId)).map(m => m.user_id);
@@ -150,7 +181,7 @@ function auth(req, res, next) {
   if (!s) return res.status(401).json({ error: 'Нужно войти в аккаунт' });
   const u = db.users.byId(s.user_id);
   if (!u) return res.status(401).json({ error: 'Нужно войти в аккаунт' });
-  req.user = { id: u.id, email: u.email, username: u.username, bio: u.bio || '', created_at: u.created_at };
+  req.user = { id: u.id, email: u.email, username: u.username, bio: u.bio || '', theme: u.theme || 'dark', created_at: u.created_at };
   req.token = t;
   next();
 }
@@ -171,7 +202,7 @@ app.post('/api/register', (req, res) => {
   if (!password || password.length < 8) return res.status(400).json({ error: 'Пароль минимум 8 символов' });
   if (db.users.byEmail(email)) return res.status(409).json({ error: 'Эта почта уже занята' });
   if (db.users.byUsername(username)) return res.status(409).json({ error: 'Этот ник уже занят' });
-  const u = db.users.insert({ email: String(email).toLowerCase(), username, password_hash: bcrypt.hashSync(password, 10), bio: '', created_at: Date.now() });
+  const u = db.users.insert({ email: String(email).toLowerCase(), username, password_hash: bcrypt.hashSync(password, 10), bio: '', theme: 'dark', created_at: Date.now() });
   createSession(req, res, u.id, !!remember);
   db.save();
   res.json({ ok: true });
@@ -203,7 +234,7 @@ app.post('/api/logout-all', auth, (req, res) => {
 app.get('/api/me', auth, (req, res) => res.json(req.user));
 
 app.patch('/api/me', auth, (req, res) => {
-  const { username, bio } = req.body || {};
+  const { username, bio, theme } = req.body || {};
   if (username !== undefined && username !== req.user.username) {
     if (!NICK_RE.test(username)) return res.status(400).json({ error: 'Ник: 3–32 символа, латиница, цифры, _ и .' });
     const other = db.users.byUsername(username);
@@ -211,7 +242,12 @@ app.patch('/api/me', auth, (req, res) => {
     db.users.update(req.user.id, { username });
     req.user.username = username;
   }
-  if (bio !== undefined) { const b = String(bio).slice(0, 190); db.users.update(req.user.id, { bio: b }); req.user.bio = b; }
+  if (bio !== undefined) { db.users.update(req.user.id, { bio: String(bio).slice(0, 190) }); req.user.bio = String(bio).slice(0, 190); }
+  if (theme !== undefined) {
+    const t = theme === 'light' ? 'light' : 'dark';
+    db.users.update(req.user.id, { theme: t });
+    req.user.theme = t;
+  }
   db.save();
   res.json(req.user);
 });
@@ -238,6 +274,10 @@ app.delete('/api/me', auth, (req, res) => {
   if (!bcrypt.compareSync((req.body || {}).password || '', u.password_hash)) return res.status(400).json({ error: 'Неверный пароль' });
   store.servers = store.servers.filter(s => s.owner_id !== req.user.id);
   store.members = store.members.filter(m => m.user_id !== req.user.id);
+  store.friends = store.friends.filter(f => f.from !== req.user.id && f.to !== req.user.id);
+  const myDms = store.dms.filter(d => d.user_a === req.user.id || d.user_b === req.user.id).map(d => d.id);
+  store.dms = store.dms.filter(d => d.user_a !== req.user.id && d.user_b !== req.user.id);
+  store.dmMessages = store.dmMessages.filter(m => !myDms.includes(m.dm_id));
   db.sessions.deleteByUser(req.user.id);
   db.users.remove(req.user.id);
   db.save();
@@ -337,7 +377,6 @@ app.post('/api/join/:code', auth, (req, res) => {
   db.save();
   res.json({ id: s.id, name: s.name });
 });
-
 // ---------- поток событий ----------
 app.get('/api/events', auth, (req, res) => {
   res.writeHead(200, {
@@ -450,12 +489,12 @@ app.get('/api/channels/:id/search', auth, (req, res) => {
   const found = db.messages.byChannel(acc.channel.id).filter(m => m.text.toLowerCase().includes(q)).slice(-50);
   res.json({ messages: found.map(publicMessage) });
 });
-
 // ---------- файлы ----------
 app.post('/api/channels/:id/files', auth, (req, res) => {
   const acc = channelAccess(req.params.id, req.user.id);
   if (acc.error) return res.status(403).json({ error: acc.error });
-  const name = String((req.body || {}).name || 'файл').replace(/[\/\\]/g, '_').slice(0, 120);
+  const rawName = (req.body || {}).name || 'файл';
+  const name = String(rawName).replace(/[\/\\]/g, '_').slice(0, 120);
   const type = String((req.body || {}).type || 'application/octet-stream').slice(0, 80);
   const data = String((req.body || {}).data || '');
   const mm = data.match(/^data:[^;]+;base64,(.*)$/);
@@ -476,7 +515,174 @@ app.get('/api/files/:id', auth, (req, res) => {
   if (!db.members.get(f.server_id, req.user.id)) return res.status(403).json({ error: 'Нет доступа к файлу' });
   res.json({ id: f.id, name: f.name, type: f.type, size: f.size, data: f.data });
 });
+// ---------- друзья ----------
+function friendCard(viewerId, otherId) {
+  const u = db.users.byId(otherId) || {};
+  return { id: u.id, username: u.username || '?', bio: u.bio || '' };
+}
+app.get('/api/friends', auth, (req, res) => {
+  const uid = req.user.id;
+  res.json({
+    friends: db.friends.accepted(uid).map(f => friendCard(uid, f.from === uid ? f.to : f.from)),
+    incoming: db.friends.incoming(uid).map(f => friendCard(uid, f.from)),
+    outgoing: db.friends.outgoing(uid).map(f => friendCard(uid, f.to))
+  });
+});
 
+app.post('/api/friends/request', auth, (req, res) => {
+  const nick = String((req.body || {}).username || '').trim();
+  if (!nick) return res.status(400).json({ error: 'Введи ник' });
+  const target = db.users.byUsername(nick);
+  if (!target) return res.status(404).json({ error: 'Пользователь с таким ником не найден' });
+  if (target.id === req.user.id) return res.status(400).json({ error: 'Это ты сам' });
+  const ex = db.friends.pair(req.user.id, target.id);
+  if (ex && ex.status === 'accepted') return res.status(409).json({ error: 'Вы уже друзья' });
+  if (ex && ex.status === 'pending') {
+    if (ex.from === target.id) {
+      ex.status = 'accepted';
+      db.save();
+      return res.json({ ok: true, accepted: true });
+    }
+    return res.status(409).json({ error: 'Заявка уже отправлена' });
+  }
+  db.friends.add({ from: req.user.id, to: target.id, status: 'pending', created_at: Date.now() });
+  db.save();
+  notifyUser(target.id, 'friend-request', friendCard(target.id, req.user.id));
+  res.json({ ok: true });
+});
+
+app.post('/api/friends/accept', auth, (req, res) => {
+  const other = Number((req.body || {}).id || 0);
+  const f = store.friends.find(x => x.from === other && x.to === req.user.id && x.status === 'pending');
+  if (!f) return res.status(404).json({ error: 'Заявка не найдена' });
+  f.status = 'accepted';
+  db.save();
+  notifyUser(other, 'friend-accept', friendCard(other, req.user.id));
+  res.json({ ok: true });
+});
+
+app.post('/api/friends/decline', auth, (req, res) => {
+  db.friends.remove(Number((req.body || {}).id || 0), req.user.id);
+  db.save();
+  res.json({ ok: true });
+});
+
+app.delete('/api/friends/:id', auth, (req, res) => {
+  db.friends.remove(Number(req.params.id), req.user.id);
+  db.save();
+  res.json({ ok: true });
+});
+
+// ---------- личные сообщения ----------
+function dmAccess(dmId, uid) {
+  const d = db.dms.byId(dmId);
+  if (!d) return { error: 'Переписка не найдена' };
+  if (d.user_a !== Number(uid) && d.user_b !== Number(uid)) return { error: 'Нет доступа' };
+  return { dm: d };
+}
+function dmOther(d, uid) { return d.user_a === Number(uid) ? d.user_b : d.user_a; }
+function openDm(uid, otherId) {
+  let d = db.dms.between(uid, otherId);
+  if (!d) d = db.dms.insert({ user_a: Number(uid), user_b: Number(otherId), created_at: Date.now() });
+  return d;
+}
+function publicDm(m) {
+  const u = db.users.byId(m.user_id) || {};
+  return {
+    id: m.id, dm_id: m.dm_id, user_id: m.user_id, username: u.username || '?',
+    text: m.text, created_at: m.created_at, edited_at: m.edited_at || null
+  };
+}
+function dmSummary(d, uid) {
+  const other = db.users.byId(dmOther(d, uid)) || {};
+  const msgs = db.dmMessages.byDm(d.id);
+  const last = msgs[msgs.length - 1] || null;
+  return {
+    id: d.id,
+    with: { id: other.id, username: other.username || '?' },
+    last: last ? { text: last.text, created_at: last.created_at, mine: last.user_id === Number(uid) } : null,
+    count: msgs.length
+  };
+}
+
+app.get('/api/dms', auth, (req, res) => {
+  const list = db.dms.forUser(req.user.id).map(d => dmSummary(d, req.user.id))
+    .filter(d => d.last)
+    .sort((a, b) => (b.last.created_at || 0) - (a.last.created_at || 0));
+  res.json(list);
+});
+
+app.post('/api/dms/open', auth, (req, res) => {
+  const otherId = Number((req.body || {}).user_id || 0);
+  const other = db.users.byId(otherId);
+  if (!other) return res.status(404).json({ error: 'Пользователь не найден' });
+  if (otherId === req.user.id) return res.status(400).json({ error: 'Нельзя писать самому себе' });
+  const d = openDm(req.user.id, otherId);
+  db.save();
+  res.json(dmSummary(d, req.user.id));
+});
+
+app.get('/api/dms/:id/messages', auth, (req, res) => {
+  const acc = dmAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  const all = db.dmMessages.byDm(acc.dm.id);
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const before = req.query.before ? Number(req.query.before) : null;
+  let slice = all;
+  if (before) slice = all.filter(m => m.id < before);
+  const out = slice.slice(-limit);
+  res.json({
+    dm: dmSummary(acc.dm, req.user.id),
+    messages: out.map(publicDm),
+    has_more: slice.length > out.length
+  });
+});
+
+app.post('/api/dms/:id/messages', auth, (req, res) => {
+  const acc = dmAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  const text = String((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Сообщение не может быть пустым' });
+  if (text.length > 2000) return res.status(400).json({ error: 'Слишком длинное сообщение' });
+  const m = db.dmMessages.insert({ dm_id: acc.dm.id, user_id: req.user.id, text, created_at: Date.now(), edited_at: null });
+  db.save();
+  const out = publicDm(m);
+  notifyUser(dmOther(acc.dm, req.user.id), 'dm', out);
+  res.json(out);
+});
+
+app.patch('/api/dm-messages/:id', auth, (req, res) => {
+  const m = db.dmMessages.byId(req.params.id);
+  if (!m) return res.status(404).json({ error: 'Сообщение не найдено' });
+  const acc = dmAccess(m.dm_id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  if (m.user_id !== req.user.id) return res.status(403).json({ error: 'Можно править только свои сообщения' });
+  const text = String((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Сообщение не может быть пустым' });
+  db.dmMessages.update(m.id, { text, edited_at: Date.now() });
+  db.save();
+  const out = publicDm(db.dmMessages.byId(m.id));
+  notifyUser(dmOther(acc.dm, req.user.id), 'dm-edit', out);
+  res.json(out);
+});
+
+app.delete('/api/dm-messages/:id', auth, (req, res) => {
+  const m = db.dmMessages.byId(req.params.id);
+  if (!m) return res.status(404).json({ error: 'Сообщение не найдено' });
+  const acc = dmAccess(m.dm_id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  if (m.user_id !== req.user.id) return res.status(403).json({ error: 'Можно удалять только свои сообщения' });
+  db.dmMessages.remove(m.id);
+  db.save();
+  notifyUser(dmOther(acc.dm, req.user.id), 'dm-delete', { id: m.id, dm_id: m.dm_id });
+  res.json({ ok: true });
+});
+
+app.get('/api/users/:id', auth, (req, res) => {
+  const u = db.users.byId(req.params.id);
+  if (!u) return res.status(404).json({ error: 'Пользователь не найден' });
+  res.json({ id: u.id, username: u.username, bio: u.bio || '', created_at: u.created_at });
+});
 // ---------- каналы ----------
 app.post('/api/servers/:id/channels', auth, (req, res) => {
   const s = db.servers.byId(req.params.id);
