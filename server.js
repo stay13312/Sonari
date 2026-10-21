@@ -1,4 +1,4 @@
-// Sonari — этапы 1–4: аккаунты, серверы, каналы, сообщения, файлы, друзья, личные сообщения
+// Sonari — этапы 1–2: аккаунты, серверы, каналы
 // База: простое хранилище на массивах + файл sonari.json (без нативных модулей)
 const express = require('express');
 const bcrypt = require('bcryptjs');
@@ -11,7 +11,7 @@ const DB_FILE = path.join(__dirname, 'sonari.json');
 
 const store = {
   users: [], sessions: [], servers: [], members: [], channels: [], messages: [], files: [],
-  friends: [], dms: [], dmMessages: [],
+  friends: [], dms: [], dmMessages: [], voice: [],
   seq: { users: 1, sessions: 1, servers: 1, channels: 1, messages: 1, files: 1, dms: 1, dmMessages: 1 }
 };
 
@@ -51,6 +51,7 @@ const db = {
       store.channels = store.channels.filter(c => c.server_id !== sid);
       store.messages = store.messages.filter(m => !chans.includes(m.channel_id));
       store.files = store.files.filter(f => f.server_id !== sid);
+      store.voice = store.voice.filter(v => !chans.includes(v.channel_id));
     }
   },
   members: {
@@ -70,20 +71,6 @@ const db = {
     insert: o => { const id = store.seq.channels++; const row = Object.assign({ id }, o); store.channels.push(row); return row; },
     update: (id, patch) => { const r = store.channels.find(c => c.id === Number(id)); if (r) Object.assign(r, patch); },
     remove: id => { store.channels = store.channels.filter(c => c.id !== Number(id)); }
-  },
-  messages: {
-    byId: id => store.messages.find(m => m.id === Number(id)),
-    byChannel: cid => store.messages.filter(m => m.channel_id === Number(cid))
-      .sort((a, b) => a.created_at - b.created_at || a.id - b.id),
-    insert: o => { const id = store.seq.messages++; const row = Object.assign({ id }, o); store.messages.push(row); return row; },
-    update: (id, patch) => { const r = store.messages.find(m => m.id === Number(id)); if (r) Object.assign(r, patch); },
-    remove: id => { store.messages = store.messages.filter(m => m.id !== Number(id)); }
-  },
-  files: {
-    byId: id => store.files.find(f => f.id === Number(id)),
-    byServer: sid => store.files.filter(f => f.server_id === Number(sid)),
-    insert: o => { const id = store.seq.files++; const row = Object.assign({ id }, o); store.files.push(row); return row; },
-    remove: id => { store.files = store.files.filter(f => f.id !== Number(id)); }
   },
   friends: {
     pair: (a, b) => store.friends.find(f =>
@@ -112,38 +99,25 @@ const db = {
     update: (id, patch) => { const r = store.dmMessages.find(m => m.id === Number(id)); if (r) Object.assign(r, patch); },
     remove: id => { store.dmMessages = store.dmMessages.filter(m => m.id !== Number(id)); }
   },
+  voice: {
+    inChannel: cid => store.voice.filter(v => v.channel_id === Number(cid)),
+    find: (cid, uid) => store.voice.find(v => v.channel_id === Number(cid) && v.user_id === Number(uid)),
+    join: o => { store.voice.push(o); },
+    leave: (cid, uid) => { store.voice = store.voice.filter(v => !(v.channel_id === Number(cid) && v.user_id === Number(uid))); },
+    leaveAll: uid => { store.voice = store.voice.filter(v => v.user_id !== Number(uid)); },
+    channelOf: uid => store.voice.find(v => v.user_id === Number(uid))
+  },
   save: () => {
-    try { fs.writeFileSync(DB_FILE, JSON.stringify(store)); } catch (e) { /* диск только для чтения */ }
+    try {
+      fs.writeFileSync(DB_FILE, JSON.stringify(store));
+    } catch (e) { /* диск может быть только для чтения — не критично */ }
   }
 };
-
-// --- живая доставка событий (Server-Sent Events) ---
-const listeners = new Map();
-function subscribe(userId, res) {
-  if (!listeners.has(userId)) listeners.set(userId, new Set());
-  listeners.get(userId).add(res);
-  res.on('close', () => {
-    const set = listeners.get(userId);
-    if (set) { set.delete(res); if (!set.size) listeners.delete(userId); }
-  });
-}
-function emitTo(userIds, event, data) {
-  const payload = 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n';
-  userIds.forEach(uid => {
-    const set = listeners.get(Number(uid));
-    if (set) set.forEach(res => { try { res.write(payload); } catch (e) {} });
-  });
-}
-function notifyUser(userId, event, data) {
-  emitTo([Number(userId)], event, data);
-}
-function serverAudience(serverId) {
-  return store.members.filter(m => m.server_id === Number(serverId)).map(m => m.user_id);
-}
-
 if (fs.existsSync(DB_FILE)) {
-  try { Object.assign(store, JSON.parse(fs.readFileSync(DB_FILE, 'utf8'))); }
-  catch (e) { console.log('Не удалось прочитать базу, начинаем с пустой'); }
+  try {
+    const saved = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    Object.assign(store, saved);
+  } catch (e) { console.log('Не удалось прочитать базу, начинаем с пустой'); }
 }
 setInterval(() => db.save(), 5000);
 
@@ -278,12 +252,38 @@ app.delete('/api/me', auth, (req, res) => {
   const myDms = store.dms.filter(d => d.user_a === req.user.id || d.user_b === req.user.id).map(d => d.id);
   store.dms = store.dms.filter(d => d.user_a !== req.user.id && d.user_b !== req.user.id);
   store.dmMessages = store.dmMessages.filter(m => !myDms.includes(m.dm_id));
+  db.voice.leaveAll(req.user.id);
   db.sessions.deleteByUser(req.user.id);
   db.users.remove(req.user.id);
   db.save();
   setCookie(req, res, '', 0);
   res.json({ ok: true });
 });
+
+// --- живая доставка событий (Server-Sent Events) ---
+const listeners = new Map();
+function subscribe(userId, res) {
+  if (!listeners.has(userId)) listeners.set(userId, new Set());
+  listeners.get(userId).add(res);
+  res.on('close', () => {
+    const set = listeners.get(userId);
+    if (set) { set.delete(res); if (!set.size) listeners.delete(userId); }
+  });
+}
+function emitTo(userIds, event, data) {
+  const payload = 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n';
+  userIds.forEach(uid => {
+    const set = listeners.get(Number(uid));
+    if (set) set.forEach(res => { try { res.write(payload); } catch (e) {} });
+  });
+}
+function notifyUser(userId, event, data) {
+  emitTo([Number(userId)], event, data);
+}
+function serverAudience(serverId) {
+  return store.members.filter(m => m.server_id === Number(serverId)).map(m => m.user_id);
+}
+
 // ---------- серверы ----------
 function membership(serverId, userId) { return db.members.get(serverId, userId); }
 function makeInvite() {
@@ -364,6 +364,7 @@ app.post('/api/servers/:id/leave', auth, (req, res) => {
   const s = db.servers.byId(req.params.id);
   if (!s) return res.status(404).json({ error: 'Сервер не найден' });
   if (s.owner_id === req.user.id) return res.status(400).json({ error: 'Владелец не может выйти: удали сервер' });
+  db.voice.leaveAll(req.user.id);
   db.members.remove(s.id, req.user.id);
   db.save();
   res.json({ ok: true });
@@ -377,6 +378,7 @@ app.post('/api/join/:code', auth, (req, res) => {
   db.save();
   res.json({ id: s.id, name: s.name });
 });
+
 // ---------- поток событий ----------
 app.get('/api/events', auth, (req, res) => {
   res.writeHead(200, {
@@ -489,6 +491,7 @@ app.get('/api/channels/:id/search', auth, (req, res) => {
   const found = db.messages.byChannel(acc.channel.id).filter(m => m.text.toLowerCase().includes(q)).slice(-50);
   res.json({ messages: found.map(publicMessage) });
 });
+
 // ---------- файлы ----------
 app.post('/api/channels/:id/files', auth, (req, res) => {
   const acc = channelAccess(req.params.id, req.user.id);
@@ -633,7 +636,7 @@ app.get('/api/dms/:id/messages', auth, (req, res) => {
   const out = slice.slice(-limit);
   res.json({
     dm: dmSummary(acc.dm, req.user.id),
-    messages: out.map(publicDm),
+    messages: out.map(m => publicDm(m, req.user.id)),
     has_more: slice.length > out.length
   });
 });
@@ -646,7 +649,7 @@ app.post('/api/dms/:id/messages', auth, (req, res) => {
   if (text.length > 2000) return res.status(400).json({ error: 'Слишком длинное сообщение' });
   const m = db.dmMessages.insert({ dm_id: acc.dm.id, user_id: req.user.id, text, created_at: Date.now(), edited_at: null });
   db.save();
-  const out = publicDm(m);
+  const out = publicDm(m, req.user.id);
   notifyUser(dmOther(acc.dm, req.user.id), 'dm', out);
   res.json(out);
 });
@@ -661,7 +664,7 @@ app.patch('/api/dm-messages/:id', auth, (req, res) => {
   if (!text) return res.status(400).json({ error: 'Сообщение не может быть пустым' });
   db.dmMessages.update(m.id, { text, edited_at: Date.now() });
   db.save();
-  const out = publicDm(db.dmMessages.byId(m.id));
+  const out = publicDm(db.dmMessages.byId(m.id), req.user.id);
   notifyUser(dmOther(acc.dm, req.user.id), 'dm-edit', out);
   res.json(out);
 });
@@ -683,6 +686,74 @@ app.get('/api/users/:id', auth, (req, res) => {
   if (!u) return res.status(404).json({ error: 'Пользователь не найден' });
   res.json({ id: u.id, username: u.username, bio: u.bio || '', created_at: u.created_at });
 });
+
+// ---------- голосовые комнаты ----------
+function voiceCard(cid, uid) {
+  const u = db.users.byId(uid) || {};
+  return { user_id: u.id, username: u.username || '?', muted: !!(db.voice.find(cid, uid) || {}).muted };
+}
+function voiceState(channelId) {
+  return db.voice.inChannel(channelId).map(v => voiceCard(channelId, v.user_id));
+}
+function broadcastVoice(serverId) {
+  const ids = serverAudience(serverId);
+  ids.forEach(uid => notifyUser(uid, 'voice', {}));
+}
+
+app.get('/api/servers/:id/voice', auth, (req, res) => {
+  const s = db.servers.byId(req.params.id);
+  if (!s) return res.status(404).json({ error: 'Сервер не найден' });
+  if (!db.members.get(s.id, req.user.id)) return res.status(403).json({ error: 'Ты не участник этого сервера' });
+  const out = {};
+  db.channels.byServer(s.id).filter(c => c.type === 'voice').forEach(c => { out[c.id] = voiceState(c.id); });
+  res.json(out);
+});
+
+app.post('/api/channels/:id/voice/join', auth, (req, res) => {
+  const acc = channelAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  if (acc.channel.type !== 'voice') return res.status(400).json({ error: 'Это не голосовой канал' });
+  db.voice.leaveAll(req.user.id);
+  db.voice.join({ channel_id: acc.channel.id, user_id: req.user.id, muted: false, at: Date.now() });
+  db.save();
+  broadcastVoice(acc.channel.server_id);
+  res.json({ ok: true, members: voiceState(acc.channel.id), others: voiceState(acc.channel.id).filter(v => v.user_id !== req.user.id).map(v => v.user_id) });
+});
+
+app.post('/api/channels/:id/voice/leave', auth, (req, res) => {
+  const acc = channelAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  db.voice.leave(acc.channel.id, req.user.id);
+  db.save();
+  broadcastVoice(acc.channel.server_id);
+  res.json({ ok: true });
+});
+
+app.post('/api/channels/:id/voice/mute', auth, (req, res) => {
+  const acc = channelAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  const v = db.voice.find(acc.channel.id, req.user.id);
+  if (v) v.muted = !!(req.body || {}).muted;
+  db.save();
+  broadcastVoice(acc.channel.server_id);
+  res.json({ ok: true });
+});
+
+// Передача сигналов между участниками комнаты
+app.post('/api/channels/:id/voice/signal', auth, (req, res) => {
+  const acc = channelAccess(req.params.id, req.user.id);
+  if (acc.error) return res.status(403).json({ error: acc.error });
+  const to = Number((req.body || {}).to || 0);
+  if (!db.voice.find(acc.channel.id, to)) return res.status(404).json({ error: 'Участник не в комнате' });
+  notifyUser(to, 'voice-signal', {
+    from: req.user.id,
+    channel_id: acc.channel.id,
+    kind: (req.body || {}).kind,
+    data: (req.body || {}).data
+  });
+  res.json({ ok: true });
+});
+
 // ---------- каналы ----------
 app.post('/api/servers/:id/channels', auth, (req, res) => {
   const s = db.servers.byId(req.params.id);
@@ -719,6 +790,7 @@ app.delete('/api/channels/:id', auth, (req, res) => {
   const m = membership(c.server_id, req.user.id);
   if (!m || (m.role !== 'owner' && m.role !== 'admin')) return res.status(403).json({ error: 'Удалить канал может только владелец' });
   store.messages = store.messages.filter(x => x.channel_id !== c.id);
+  store.voice = store.voice.filter(v => v.channel_id !== c.id);
   db.channels.remove(c.id);
   db.save();
   res.json({ ok: true });
